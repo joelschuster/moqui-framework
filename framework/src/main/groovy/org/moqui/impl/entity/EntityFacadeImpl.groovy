@@ -1122,6 +1122,11 @@ class EntityFacadeImpl implements EntityFacade {
         return ecfi.confXmlRoot.first("database-list")
                 .first({ MNode it -> it.name == 'database' && it.attribute("name") == confName })
     }
+    String getDatabaseConfName(String entityName) {
+        MNode dsNode = getDatasourceNode(getEntityGroupName(entityName))
+        if (dsNode == null) return null
+        return dsNode.attribute("database-conf-name")
+    }
 
     MNode getDatasourceNode(String groupName) {
         MNode node = datasourceNodeByGroupName.get(groupName)
@@ -1315,7 +1320,7 @@ class EntityFacadeImpl implements EntityFacade {
 
         if (node.hasChild("having-econditions")) {
             for (MNode havingCond in node.children("having-econditions"))
-                ef.havingCondition(getConditionFactoryImpl().makeActionCondition(havingCond))
+                ef.havingCondition(getConditionFactoryImpl().makeActionConditions(havingCond))
         }
 
         return ef
