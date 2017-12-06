@@ -56,6 +56,7 @@ public abstract class EntityValueBase implements EntityValue {
     private static final String UPDATE_ERROR = "Error updating ${entityName} ${primaryKeys}";
     private static final String DELETE_ERROR = "Error deleting ${entityName} ${primaryKeys}";
     private static final String REFRESH_ERROR = "Error finding ${entityName} ${primaryKeys}";
+    private static final String PLACEHOLDER = "PLHLDR";
 
     private String entityName;
     final HashMap<String, Object> valueMapInternal = new HashMap<>();
@@ -136,13 +137,23 @@ public abstract class EntityValueBase implements EntityValue {
     public boolean getIsFromDb() { return isFromDb; }
 
     @Override public String getEntityName() { return entityName; }
+    @Override public String getEntityNamePretty() { return StringUtilities.camelCaseToPretty(getEntityDefinition().getEntityName()); }
     @Override public boolean isModified() { return modified; }
     @Override public boolean isFieldModified(String name) {
+        Object valueMapValue = valueMapInternal.getOrDefault(name, PLACEHOLDER);
+        // identity compare as alternative to containsKey() call, if is PLACEHOLDER then Map didn't contain the key
+        if (valueMapValue == PLACEHOLDER) return false;
+        if (dbValueMap == null) return true;
+        Object dbValue = dbValueMap.getOrDefault(name, PLACEHOLDER);
+        if (dbValue == PLACEHOLDER) return true;
+        return (valueMapValue == null && dbValue != null) || (valueMapValue != null && !valueMapValue.equals(dbValue));
+        /*
         if (!valueMapInternal.containsKey(name)) return false;
         if (dbValueMap == null || !dbValueMap.containsKey(name)) return true;
         Object valueMapValue = valueMapInternal.get(name);
         Object dbValue = dbValueMap.get(name);
         return (valueMapValue == null && dbValue != null) || (valueMapValue != null && !valueMapValue.equals(dbValue));
+        */
     }
     @Override public boolean isFieldSet(String name) { return valueMapInternal.containsKey(name); }
     @Override public boolean isField(String name) { return getEntityDefinition().isField(name); }
@@ -426,7 +437,7 @@ public abstract class EntityValueBase implements EntityValue {
         try {
             if (o instanceof byte[]) return new SerialBlob((byte[]) o);
         } catch (Exception e) {
-            throw new EntityException("Error getting SerialBloc for field " + name + " in entity " + entityName, e);
+            throw new EntityException("Error getting SerialBlob for field " + name + " in entity " + entityName, e);
         }
         // try groovy...
         return DefaultGroovyMethods.asType(o, SerialBlob.class);
@@ -574,7 +585,8 @@ public abstract class EntityValueBase implements EntityValue {
         FieldInfo[] fieldInfoList = ed.entityInfo.allFieldInfoArray;
         for (int i = 0; i < fieldInfoList.length; i++) {
             FieldInfo fieldInfo = fieldInfoList[i];
-            if ("true".equals(fieldInfo.enableAuditLog) || (isUpdate && "update".equals(fieldInfo.enableAuditLog))) {
+            boolean isLogUpdate = "update".equals(fieldInfo.enableAuditLog);
+            if ((!isLogUpdate && "true".equals(fieldInfo.enableAuditLog)) || (isUpdate && isLogUpdate)) {
                 String fieldName = fieldInfo.name;
 
                 // is there a new value? if not continue
@@ -582,14 +594,25 @@ public abstract class EntityValueBase implements EntityValue {
 
                 Object value = get(fieldName);
                 Object oldValue = oldValues != null ? oldValues.get(fieldName) : null;
+                // if set to log updates and old value is null don't consider it an update (is initial set of value)
+                if (isLogUpdate && oldValue == null) continue;
                 if (isUpdate) {
                     // if isUpdate but old value == new value, then it hasn't been updated, so skip it
-                    if (value == null) { if (oldValue == null) continue; }
-                    else { if (value.equals(oldValue)) continue; }
+                    if (value == null) {
+                        if (oldValue == null) continue;
+                    } else {
+                        if (value instanceof BigDecimal && oldValue instanceof BigDecimal) {
+                            // better handling for BigDecimal, perhaps others
+                            if (((BigDecimal) value).compareTo((BigDecimal) oldValue) == 0) continue;
+                        } else {
+                            if (value.equals(oldValue)) continue;
+                        }
+                    }
                 } else {
                     // if it's a create and there is no value don't log a change
                     if (value == null) continue;
                 }
+                // logger.warn("EntityAuditLog field " + fieldName + " old " + oldValue + " (" + (oldValue != null ? oldValue.getClass().getName() : "null") + ") new " + value + " (" + (value != null ? value.getClass().getName() : "null") + ")");
 
                 // don't skip for this, if a field was reset then we want to record that: if (!value) continue
 
@@ -612,7 +635,7 @@ public abstract class EntityValueBase implements EntityValue {
                 parms.put("changedByUserId", ec.getUser().getUserId());
                 parms.put("changedInVisitId", ec.getUser().getVisitId());
                 parms.put("artifactStack", stackNameString);
-                parms.put("oldValueText", oldValue);
+                if (oldValue != null) parms.put("oldValueText", ObjectUtilities.toPlainString(oldValue));
                 parms.putAll(pksValueMap);
 
                 // logger.warn("TOREMOVE: in handleAuditLog for [${ed.entityName}.${fieldName}] value=[${value}], oldValue=[${oldValue}], oldValues=[${oldValues}]", new Exception("AuditLog location"))
@@ -649,10 +672,14 @@ public abstract class EntityValueBase implements EntityValue {
                                   Boolean useCache, Boolean forUpdate) {
         EntityJavaUtil.RelationshipInfo relInfo = getEntityDefinition().getRelationshipInfo(relationshipName);
         if (relInfo == null) throw new EntityException("Relationship " + relationshipName + " not found in entity " + entityName);
+        return findRelated(relInfo, byAndFields, orderBy, useCache, forUpdate);
+    }
 
+    private EntityList findRelated(final EntityJavaUtil.RelationshipInfo relInfo, Map<String, Object> byAndFields,
+                                   List<String> orderBy, Boolean useCache, Boolean forUpdate) {
         String relatedEntityName = relInfo.relatedEntityName;
         Map<String, String> keyMap = relInfo.keyMap;
-        if (keyMap == null || keyMap.size() == 0) throw new EntityException("Relationship " + relationshipName + " in entity " + entityName + " has no key-map sub-elements and no default values");
+        if (keyMap == null || keyMap.size() == 0) throw new EntityException("Relationship " + relInfo.relationshipName + " in entity " + entityName + " has no key-map sub-elements and no default values");
 
         // make a Map where the key is the related entity's field name, and the value is the value from this entity
         Map<String, Object> condMap = new HashMap<>();
@@ -704,6 +731,22 @@ public abstract class EntityValueBase implements EntityValue {
     }
 
     @Override
+    public EntityList findRelatedFk(Set<String> skipEntities) {
+        EntityList relatedList = new EntityListImpl(getEntityFacadeImpl());
+        ArrayList<EntityJavaUtil.RelationshipInfo> relInfoList = getEntityDefinition().getRelationshipsInfo(false);
+        int relInfoListSize = relInfoList.size();
+        for (int i = 0; i < relInfoListSize; i++) {
+            EntityJavaUtil.RelationshipInfo relInfo = relInfoList.get(i);
+            EntityJavaUtil.RelationshipInfo reverseInfo = relInfo.findReverse();
+            if (reverseInfo == null || !reverseInfo.isTypeOne || (skipEntities != null && (skipEntities.contains(reverseInfo.fromEd.fullEntityName) ||
+                    skipEntities.contains(reverseInfo.fromEd.getShortAlias()) || skipEntities.contains(reverseInfo.fromEd.getEntityName())))) continue;
+            EntityList curList = findRelated(relInfo, null, null, null, null);
+            relatedList.addAll(curList);
+        }
+        return relatedList;
+    }
+
+    @Override
     public void deleteRelated(String relationshipName) {
         // NOTE: this does a select for update, may consider not doing that by default
         EntityList relatedList = findRelated(relationshipName, null, null, false, true);
@@ -732,14 +775,48 @@ public abstract class EntityValueBase implements EntityValue {
         if (foundNonDeleteRelated) return false;
 
         // delete related records to delete
-        for (String delRelName : relationshipsToDelete) {
-            deleteRelated(delRelName);
-        }
-
+        for (String delRelName : relationshipsToDelete) deleteRelated(delRelName);
         // delete this record
         delete();
-
+        // done, successful delete
         return true;
+    }
+
+    @Override
+    public void deleteWithCascade(Set<String> clearRefEntities, Set<String> validateAllowDeleteEntities) {
+        ArrayList<EntityJavaUtil.RelationshipInfo> relInfoList = getEntityDefinition().getRelationshipsInfo(false);
+        int relInfoListSize = relInfoList.size();
+        for (int i = 0; i < relInfoListSize; i++) {
+            // find relationships with a type one reverse (relationships for records that depend on this)
+            EntityJavaUtil.RelationshipInfo relInfo = relInfoList.get(i);
+            EntityJavaUtil.RelationshipInfo reverseInfo = relInfo.findReverse();
+            if (reverseInfo == null || !reverseInfo.isTypeOne) continue;
+            // see if we should clear ref fields or delete
+            EntityDefinition relEd = relInfo.relatedEd;
+            boolean clearRef = clearRefEntities != null && (clearRefEntities.contains(relEd.fullEntityName) ||
+                    clearRefEntities.contains(relEd.getShortAlias()) || clearRefEntities.contains(relEd.getEntityName()));
+            // find records
+            EntityList relList = findRelated(relInfo, null, null, null, null);
+            int relListSize = relList.size();
+            for (int j = 0; j < relListSize; j++) {
+                EntityValue relVal = relList.get(j);
+                if (clearRef) {
+                    for (String fieldName : reverseInfo.keyMap.keySet()) {
+                        if (relEd.isPkField(fieldName)) throw new EntityException("In deleteWithCascade on entity " + getEntityName() + " related entity " + relEd.fullEntityName + " is in the clear ref set but field " + fieldName + " is a primary key field and cannot be cleared");
+                        relVal.set(fieldName, null);
+                    }
+                    relVal.update();
+                } else {
+                    // if we should validate entities we are attempting to delete do that now
+                    if (validateAllowDeleteEntities != null && !validateAllowDeleteEntities.contains(relEd.fullEntityName))
+                        throw new EntityException("Cannot delete " + getEntityNamePretty() + " " + getPrimaryKeys() + ", found " + relVal.getEntityNamePretty() + " " + relVal.getPrimaryKeys() + " that depends on it");
+                    // delete with cascade
+                    relVal.deleteWithCascade(clearRefEntities, validateAllowDeleteEntities);
+                }
+            }
+        }
+        // delete this record
+        delete();
     }
 
     @Override
@@ -1197,7 +1274,7 @@ public abstract class EntityValueBase implements EntityValue {
 
         // do the artifact push/authz
         ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(entityName, ArtifactExecutionInfo.AT_ENTITY, ArtifactExecutionInfo.AUTHZA_CREATE, "create").setParameters(valueMapInternal);
-        aefi.pushInternal(aei, !entityInfo.authorizeSkipCreate);
+        aefi.pushInternal(aei, !entityInfo.authorizeSkipCreate, false);
 
         try {
             // run EECA before rules
@@ -1290,7 +1367,7 @@ public abstract class EntityValueBase implements EntityValue {
 
         // do the artifact push/authz
         ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(entityName, ArtifactExecutionInfo.AT_ENTITY, ArtifactExecutionInfo.AUTHZA_UPDATE, "update").setParameters(valueMapInternal);
-        aefi.pushInternal(aei, !entityInfo.authorizeSkipTrue);
+        aefi.pushInternal(aei, !entityInfo.authorizeSkipTrue, false);
 
         try {
             // run EECA before rules
@@ -1322,8 +1399,8 @@ public abstract class EntityValueBase implements EntityValue {
             }
 
             // if (ed.getEntityName() == "foo") logger.warn("================ evb.update() ${getEntityName()} nonPkFieldList=${nonPkFieldList};\nvalueMap=${valueMap};\noldValues=${oldValues}")
-            if (nonPkFieldArrayIndex == 0) {
-                if (logger.isTraceEnabled()) logger.trace("Not doing update on entity with no populated non-PK fields; entity=" + this.toString());
+            if (nonPkFieldArrayIndex == 0 || (nonPkFieldArrayIndex == 1 && modifiedLastUpdatedStamp)) {
+                if (logger.isTraceEnabled()) logger.trace("Not doing update on entity with no changed non-PK fields; value=" + this.toString());
                 return this;
             }
 
@@ -1335,7 +1412,7 @@ public abstract class EntityValueBase implements EntityValue {
             if (optimisticLock) {
                 Object valueLus = valueMapInternal.get("lastUpdatedStamp");
                 Object dbLus = dbValueMap.get("lastUpdatedStamp");
-                if (dbLus != null && !dbLus.equals(valueLus))
+                if (valueLus != null && dbLus != null && !dbLus.equals(valueLus))
                     throw new EntityException("This record was updated by someone else at " + valueLus + " which was after the version you loaded at " + dbLus + ". Not updating to avoid overwriting data.");
             }
 
@@ -1423,7 +1500,7 @@ public abstract class EntityValueBase implements EntityValue {
 
         // do the artifact push/authz
         ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(entityName, ArtifactExecutionInfo.AT_ENTITY, ArtifactExecutionInfo.AUTHZA_DELETE, "delete").setParameters(valueMapInternal);
-        aefi.pushInternal(aei, !entityInfo.authorizeSkipTrue);
+        aefi.pushInternal(aei, !entityInfo.authorizeSkipTrue, false);
 
         try {
             // run EECA before rules
@@ -1458,6 +1535,7 @@ public abstract class EntityValueBase implements EntityValue {
     @Override
     public boolean refresh() {
         final EntityDefinition ed = getEntityDefinition();
+        final EntityJavaUtil.EntityInfo entityInfo = ed.entityInfo;
         final EntityFacadeImpl efi = getEntityFacadeImpl();
         final ExecutionContextFactoryImpl ecfi = efi.ecfi;
         final ExecutionContextImpl ec = ecfi.getEci();
@@ -1470,9 +1548,12 @@ public abstract class EntityValueBase implements EntityValue {
             return false;
         }
 
+        // check/set defaults
+        if (entityInfo.hasFieldDefaults) checkSetFieldDefaults(ed, ec, null);
+
         // do the artifact push/authz
         ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(entityName, ArtifactExecutionInfo.AT_ENTITY, ArtifactExecutionInfo.AUTHZA_VIEW, "refresh").setParameters(valueMapInternal);
-        aefi.pushInternal(aei, !ed.entityInfo.authorizeSkipView);
+        aefi.pushInternal(aei, !ed.entityInfo.authorizeSkipView, false);
 
         boolean retVal = false;
         try {
@@ -1519,12 +1600,12 @@ public abstract class EntityValueBase implements EntityValue {
             return fi.name.hashCode() + (val != null ? val.hashCode() : 0);
         }
         @Override public boolean equals(Object obj) {
-            if (obj instanceof EntityFieldEntry) {
-                EntityFieldEntry other = (EntityFieldEntry) obj;
-                return fi.name.equals(other.fi.name) && getValue().equals(other.getValue());
-            } else {
-                return false;
-            }
+            if (!(obj instanceof EntityFieldEntry)) return false;
+            EntityFieldEntry other = (EntityFieldEntry) obj;
+            if (!fi.name.equals(other.fi.name)) return false;
+            Object thisVal = getValue();
+            Object otherVal = other.getValue();
+            return thisVal == null ? otherVal == null : thisVal.equals(otherVal);
         }
     }
 

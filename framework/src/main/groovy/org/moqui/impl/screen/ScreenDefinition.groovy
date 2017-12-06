@@ -15,6 +15,7 @@ package org.moqui.impl.screen
 
 import groovy.transform.CompileStatic
 import org.codehaus.groovy.runtime.InvokerHelper
+import org.moqui.BaseArtifactException
 import org.moqui.BaseException
 import org.moqui.context.ArtifactExecutionInfo
 import org.moqui.context.ExecutionContext
@@ -115,7 +116,7 @@ class ScreenDefinition {
             ScreenDefinition includeScreen = ecfi.screenFacade.getScreenDefinition(transitionInclNode.attribute("location"))
             if (includeScreen != null) dependsOnScreenLocations.add(includeScreen.location)
             MNode transitionNode = includeScreen?.getTransitionItem(transitionInclNode.attribute("name"), transitionInclNode.attribute("method"))?.transitionNode
-            if (transitionNode == null) throw new IllegalArgumentException("For transition-include could not find transition ${transitionInclNode.attribute("name")} with method ${transitionInclNode.attribute("method")} in screen at ${transitionInclNode.attribute("location")}")
+            if (transitionNode == null) throw new BaseArtifactException("For transition-include could not find transition ${transitionInclNode.attribute("name")} with method ${transitionInclNode.attribute("method")} in screen at ${transitionInclNode.attribute("location")}")
             TransitionItem ti = new TransitionItem(transitionNode, this)
             transitionByName.put(ti.method == "any" ? ti.name : ti.name + "#" + ti.method, ti)
         }
@@ -203,7 +204,7 @@ class ScreenDefinition {
 
         ScreenDefinition includeScreen = sfi.getEcfi().screenFacade.getScreenDefinition(location)
         ScreenSection includeSection = includeScreen?.getSection(sectionName)
-        if (includeSection == null) throw new IllegalArgumentException("Could not find section [${sectionNode.attribute("name")} to include at location [${sectionNode.attribute("location")}]")
+        if (includeSection == null) throw new BaseArtifactException("Could not find section [${sectionNode.attribute("name")} to include at location [${sectionNode.attribute("location")}]")
         sectionByName.put(sectionNode.attribute("name"), includeSection)
         dependsOnScreenLocations.add(location)
 
@@ -354,11 +355,16 @@ class ScreenDefinition {
             if (remainingPathNameList.size() > 1) {
                 ArrayList<String> subPathNameList = new ArrayList<>(remainingPathNameList)
                 subPathNameList.remove(0)
-                ScreenDefinition subSd = sfi.getScreenDefinition(curSsi.getLocation())
-                ArrayList<String> subPath = subSd.findSubscreenPath(subPathNameList)
-                if (!subPath) return null
-                subPath.add(0, curName)
-                return subPath
+                try {
+                    ScreenDefinition subSd = sfi.getScreenDefinition(curSsi.getLocation())
+                    ArrayList<String> subPath = subSd.findSubscreenPath(subPathNameList)
+                    if (!subPath) return null
+                    subPath.add(0, curName)
+                    return subPath
+                } catch (Exception e) {
+                    logger.error("Error finding subscreens under screen at ${curSsi.getLocation()}", BaseException.filterStackTrace(e))
+                    return null
+                }
             } else {
                 return remainingPathNameList
             }
@@ -369,9 +375,14 @@ class ScreenDefinition {
 
         // breadth first by looking at subscreens of each subscreen on a first pass
         for (Map.Entry<String, SubscreensItem> entry in subscreensByName.entrySet()) {
-            ScreenDefinition subSd = sfi.getScreenDefinition(entry.getValue().getLocation())
+            ScreenDefinition subSd = null
+            try {
+                subSd = sfi.getScreenDefinition(entry.getValue().getLocation())
+            } catch (Exception e) {
+                logger.error("Error finding subscreens under screen ${entry.key} at ${entry.getValue().getLocation()}", BaseException.filterStackTrace(e))
+            }
             if (subSd == null) {
-                if (logger.isTraceEnabled()) logger.trace("Screen [${entry.getKey()}] at location [${entry.getValue().getLocation()}] not found, subscreen of [${this.getLocation()}]")
+                if (logger.isTraceEnabled()) logger.trace("Screen ${entry.getKey()} at ${entry.getValue().getLocation()} not found, subscreen of [${this.getLocation()}]")
                 continue
             }
             SubscreensItem subSsi = subSd.getSubscreensItem(curName)
@@ -395,9 +406,14 @@ class ScreenDefinition {
         }
         // not immediate child or grandchild subscreen, start recursion
         for (Map.Entry<String, SubscreensItem> entry in subscreensByName.entrySet()) {
-            ScreenDefinition subSd = sfi.getScreenDefinition(entry.getValue().getLocation())
+            ScreenDefinition subSd = null
+            try {
+                subSd = sfi.getScreenDefinition(entry.getValue().getLocation())
+            } catch (Exception e) {
+                logger.error("Error finding subscreens under screen ${entry.key} at ${entry.getValue().getLocation()}", BaseException.filterStackTrace(e))
+            }
             if (subSd == null) {
-                if (logger.isTraceEnabled()) logger.trace("Screen [${entry.getKey()}] at location [${entry.getValue().getLocation()}] not found, subscreen of [${this.getLocation()}]")
+                if (logger.isTraceEnabled()) logger.trace("Screen ${entry.getKey()} at ${entry.getValue().getLocation()} not found, subscreen of [${this.getLocation()}]")
                 continue
             }
             List<String> subPath = subSd.findSubscreenPath(remainingPathNameList)
@@ -430,12 +446,16 @@ class ScreenDefinition {
         List<SubscreensItem> ssiList = getSubscreensItemsSorted()
         for (SubscreensItem ssi in ssiList) {
             if (screensToSkip.contains(ssi.name)) continue
-            ScreenDefinition subSd = sfi.getScreenDefinition(ssi.location)
-            if (!subSd.hasRequiredParameters()) {
-                String subPath = (currentPath ? currentPath + "/" : '') + ssi.name
-                // don't add current if a has a default subscreen item
-                if (!subSd.getDefaultSubscreensItem()) locList.add(subPath)
-                locList.addAll(subSd.nestedNoReqParmLocations(subPath, screensToSkip))
+            try {
+                ScreenDefinition subSd = sfi.getScreenDefinition(ssi.location)
+                if (!subSd.hasRequiredParameters()) {
+                    String subPath = (currentPath ? currentPath + "/" : '') + ssi.name
+                    // don't add current if it a has a default subscreen item
+                    if (!subSd.getDefaultSubscreensItem()) locList.add(subPath)
+                    locList.addAll(subSd.nestedNoReqParmLocations(subPath, screensToSkip))
+                }
+            } catch (Exception e) {
+                logger.error("Error finding no parameter screens under ${this.location} for subscreen location ${ssi.location}", e)
             }
         }
         return locList
@@ -476,7 +496,7 @@ class ScreenDefinition {
                 ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, sri.outputContentType)
         if ("false".equals(screenNode.attribute("track-artifact-hit"))) aei.setTrackArtifactHit(false)
         sri.ec.artifactExecutionFacade.pushInternal(aei, isTargetScreen ?
-                (requireAuthentication == null || requireAuthentication.length() == 0 || "true".equals(requireAuthentication)) : false)
+                (requireAuthentication == null || requireAuthentication.length() == 0 || "true".equals(requireAuthentication)) : false, true)
 
         boolean loggedInAnonymous = false
         if ("anonymous-all".equals(requireAuthentication)) {
@@ -499,17 +519,17 @@ class ScreenDefinition {
 
     ScreenSection getSection(String sectionName) {
         ScreenSection ss = sectionByName.get(sectionName)
-        if (ss == null) throw new BaseException("Could not find section ${sectionName} in screen ${getLocation()}")
+        if (ss == null) throw new BaseArtifactException("Could not find section ${sectionName} in screen ${getLocation()}")
         return ss
     }
     ScreenForm getForm(String formName) {
         ScreenForm sf = formByName.get(formName)
-        if (sf == null) throw new BaseException("Could not find form ${formName} in screen ${getLocation()}")
+        if (sf == null) throw new BaseArtifactException("Could not find form ${formName} in screen ${getLocation()}")
         return sf
     }
     ScreenTree getTree(String treeName) {
         ScreenTree st = treeByName.get(treeName)
-        if (st == null) throw new BaseException("Could not find tree ${treeName} in screen ${getLocation()}")
+        if (st == null) throw new BaseArtifactException("Could not find tree ${treeName} in screen ${getLocation()}")
         return st
     }
 
@@ -731,7 +751,7 @@ class ScreenDefinition {
             String requireAuthentication = (String) parentScreen.screenNode.attribute('require-authentication')
             ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl("${parentScreen.location}/${name}",
                     ArtifactExecutionInfo.AT_XML_SCREEN_TRANS, ArtifactExecutionInfo.AUTHZA_VIEW, sri.outputContentType)
-            ec.artifactExecutionFacade.pushInternal(aei, (!requireAuthentication || "true".equals(requireAuthentication)))
+            ec.artifactExecutionFacade.pushInternal(aei, (!requireAuthentication || "true".equals(requireAuthentication)), true)
 
             boolean loggedInAnonymous = false
             if (requireAuthentication == "anonymous-all") {
@@ -799,7 +819,7 @@ class ScreenDefinition {
             ContextStack context = ec.contextStack
             context.put("sri", sri)
             WebFacade wf = ec.getWeb()
-            if (wf == null) throw new BaseException("Cannot run actions transition outside of a web request")
+            if (wf == null) throw new BaseArtifactException("Cannot run actions transition outside of a web request")
 
             ArrayList<String> extraPathList = sri.screenUrlInfo.extraPathNameList
             if (extraPathList != null && extraPathList.size() > 0) {
@@ -807,7 +827,7 @@ class ScreenDefinition {
                 // is it a form or tree?
                 ScreenForm form = parentScreen.formByName.get(partName)
                 if (form != null) {
-                    if (!form.hasDataPrep()) throw new BaseException("Found form ${partName} in screen ${parentScreen.getScreenName()} but it does not have its own data preparation")
+                    if (!form.hasDataPrep()) throw new BaseArtifactException("Found form ${partName} in screen ${parentScreen.getScreenName()} but it does not have its own data preparation")
                     ScreenForm.FormInstance formInstance = form.getFormInstance()
                     if (formInstance.isList()) {
                         ScreenForm.FormListRenderInfo renderInfo = formInstance.makeFormListRenderInfo()
@@ -832,7 +852,7 @@ class ScreenDefinition {
                     if (tree != null) {
                         tree.sendSubNodeJson()
                     } else {
-                        throw new BaseException("Could not find form or tree named ${partName} in screen ${parentScreen.getScreenName()} so cannot run its actions")
+                        throw new BaseArtifactException("Could not find form or tree named ${partName} in screen ${parentScreen.getScreenName()} so cannot run its actions")
                     }
                 }
             } else {
@@ -866,7 +886,7 @@ class ScreenDefinition {
             redirectUrl.addParameters(sri.getCurrentScreenUrl().getParameterMap()).removeParameter("columnsTree")
                     .removeParameter("formLocation").removeParameter("ResetColumns").removeParameter("SaveColumns")
 
-            if (!sri.sendJsonRedirect(redirectUrl)) sri.response.sendRedirect(redirectUrl.getUrlWithParams())
+            if (!sri.sendJsonRedirect(redirectUrl, null)) sri.response.sendRedirect(redirectUrl.getUrlWithParams())
             return defaultResponse
         }
     }
@@ -898,7 +918,7 @@ class ScreenDefinition {
             Map<String, Object> flfInfo = ScreenForm.getFormListFindInfo(formListFindId, sri.ec, null)
             fwdInstance.addParameters((Map<String, String>) flfInfo.findParameters)
 
-            if (!sri.sendJsonRedirect(fwdInstance)) sri.response.sendRedirect(fwdInstance.getUrlWithParams())
+            if (!sri.sendJsonRedirect(fwdInstance, null)) sri.response.sendRedirect(fwdInstance.getUrlWithParams())
             return noneResponse
         }
     }
@@ -976,7 +996,7 @@ class ScreenDefinition {
         boolean checkCondition(ExecutionContextImpl ec) { return condition ? condition.checkCondition(ec) : true }
 
         String getType() { return type }
-        String getUrl() { return parentScreen.sfi.ecfi.resourceFacade.expand(url, "") }
+        String getUrl() { return parentScreen.sfi.ecfi.resourceFacade.expandNoL10n(url, "") }
         String getUrlType() { return urlType }
         boolean getSaveCurrentScreen() { return saveCurrentScreen }
         boolean getSaveParameters() { return saveParameters }
@@ -1041,7 +1061,7 @@ class ScreenDefinition {
             ExecutionContextFactoryImpl ecfi = parentScreen.sfi.ecfi
             ResourceReference screenRr = ecfi.resourceFacade.getLocationReference(location)
             MNode screenNode = MNode.parseRootOnly(screenRr)
-            return getPrettyMenuName(screenNode.attribute("default-menu-title"), location, ecfi)
+            return getPrettyMenuName(screenNode?.attribute("default-menu-title"), location, ecfi)
         }
 
         String getName() { return name }

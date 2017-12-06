@@ -50,19 +50,16 @@ public class EntityFindImpl extends EntityFindBase {
         // table doesn't exist, just return null
         if (!ed.tableExistsDbMetaOnly()) return null;
 
-        EntityFindBuilder efb = new EntityFindBuilder(ed, this);
+        EntityFindBuilder efb = new EntityFindBuilder(ed, this, whereCondition, fieldInfoArray);
 
         // SELECT fields
         efb.makeSqlSelectFields(fieldInfoArray, fieldOptionsArray, false);
         // FROM Clause
-        efb.makeSqlFromClause(fieldInfoArray);
+        efb.makeSqlFromClause();
         // WHERE clause only for one/pk query
-        if (whereCondition != null) {
-            efb.startWhereClause();
-            whereCondition.makeSqlWhere(efb);
-        }
+        efb.makeWhereClause();
         // GROUP BY clause
-        efb.makeGroupByClause(fieldInfoArray);
+        efb.makeGroupByClause();
         // FOR UPDATE
         if (getForUpdate()) efb.makeForUpdate();
 
@@ -94,6 +91,7 @@ public class EntityFindImpl extends EntityFindBase {
             }
 
             if (isTraceEnabled && rs.next()) logger.trace("Found more than one result for condition " + condSql + " on entity " + entityName);
+            queryTextList.add(efb.finalSql);
         } finally {
             try { efb.closeAll(); }
             catch (SQLException sqle) { logger.error("Error closing query", sqle); }
@@ -111,25 +109,19 @@ public class EntityFindImpl extends EntityFindBase {
         // table doesn't exist, just return empty ELI
         if (!ed.tableExistsDbMetaOnly()) return new EntityListIteratorWrapper(new ArrayList<>(), ed, efi, null, null);
 
-        EntityFindBuilder efb = new EntityFindBuilder(ed, this);
+        EntityFindBuilder efb = new EntityFindBuilder(ed, this, whereCondition, fieldInfoArray);
         if (getDistinct()) efb.makeDistinct();
 
         // select fields
         efb.makeSqlSelectFields(fieldInfoArray, fieldOptionsArray, false);
         // FROM Clause
-        efb.makeSqlFromClause(fieldInfoArray);
+        efb.makeSqlFromClause();
         // WHERE clause
-        if (whereCondition != null) {
-            efb.startWhereClause();
-            whereCondition.makeSqlWhere(efb);
-        }
+        efb.makeWhereClause();
         // GROUP BY clause
-        efb.makeGroupByClause(fieldInfoArray);
+        efb.makeGroupByClause();
         // HAVING clause
-        if (havingCondition != null) {
-            efb.startHavingClause();
-            havingCondition.makeSqlWhere(efb);
-        }
+        efb.makeHavingClause(havingCondition);
 
         boolean hasLimitOffset = limit != null || offset != null;
         // ORDER BY clause
@@ -155,6 +147,7 @@ public class EntityFindImpl extends EntityFindBase {
             elii = new EntityListIteratorImpl(con, rs, ed, fieldInfoArray, efi, txCache, whereCondition, orderByExpanded);
             // ResultSet will be closed in the EntityListIterator
             efb.releaseAll();
+            queryTextList.add(efb.finalSql);
         } catch (Throwable t) {
             // close the ResultSet/etc on error as there won't be an ELI
             try { efb.closeAll(); }
@@ -174,7 +167,7 @@ public class EntityFindImpl extends EntityFindBase {
         // table doesn't exist, just return 0
         if (!ed.tableExistsDbMetaOnly()) return 0;
 
-        EntityFindBuilder efb = new EntityFindBuilder(ed, this);
+        EntityFindBuilder efb = new EntityFindBuilder(ed, this, whereCondition, fieldInfoArray);
 
         ArrayList<MNode> entityConditionList = ed.internalEntityNode.children("entity-condition");
         MNode condNode = entityConditionList != null && entityConditionList.size() > 0 ? entityConditionList.get(0) : null;
@@ -182,21 +175,15 @@ public class EntityFindImpl extends EntityFindBase {
         boolean isGroupBy = ed.entityInfo.hasFunctionAlias;
 
         // count function instead of select fields
-        efb.makeCountFunction(fieldInfoArray, fieldOptionsArray, isDistinct, isGroupBy);
+        efb.makeCountFunction(fieldOptionsArray, isDistinct, isGroupBy);
         // FROM Clause
-        efb.makeSqlFromClause(fieldInfoArray);
+        efb.makeSqlFromClause();
         // WHERE clause
-        if (whereCondition != null) {
-            efb.startWhereClause();
-            whereCondition.makeSqlWhere(efb);
-        }
+        efb.makeWhereClause();
         // GROUP BY clause
-        efb.makeGroupByClause(fieldInfoArray);
+        efb.makeGroupByClause();
         // HAVING clause
-        if (havingCondition != null) {
-            efb.startHavingClause();
-            havingCondition.makeSqlWhere(efb);
-        }
+        efb.makeHavingClause(havingCondition);
 
         efb.closeCountSubSelect(fieldInfoArray.length, isDistinct, isGroupBy);
 
@@ -214,6 +201,7 @@ public class EntityFindImpl extends EntityFindBase {
 
             ResultSet rs = efb.executeQuery();
             if (rs.next()) count = rs.getLong(1);
+            queryTextList.add(efb.finalSql);
         } finally {
             try { efb.closeAll(); }
             catch (SQLException sqle) { logger.error("Error closing query", sqle); }

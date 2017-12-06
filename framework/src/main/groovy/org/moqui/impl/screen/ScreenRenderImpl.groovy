@@ -14,8 +14,9 @@
 package org.moqui.impl.screen
 
 import freemarker.template.Template
+import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
-
+import org.moqui.BaseArtifactException
 import org.moqui.BaseException
 import org.moqui.context.*
 import org.moqui.entity.EntityCondition.ComparisonOperator
@@ -24,6 +25,7 @@ import org.moqui.entity.EntityList
 import org.moqui.entity.EntityListIterator
 import org.moqui.entity.EntityValue
 import org.moqui.impl.entity.EntityFacadeImpl
+import org.moqui.screen.ScreenTest
 import org.moqui.util.WebUtilities
 import org.moqui.impl.context.ArtifactExecutionInfoImpl
 import org.moqui.impl.context.ContextJavaUtil
@@ -33,7 +35,6 @@ import org.moqui.impl.context.ResourceFacadeImpl
 import org.moqui.impl.context.WebFacadeImpl
 import org.moqui.impl.entity.EntityDefinition
 import org.moqui.impl.entity.EntityValueBase
-import org.moqui.impl.entity.EntityValueImpl
 import org.moqui.impl.screen.ScreenDefinition.ResponseItem
 import org.moqui.impl.screen.ScreenDefinition.SubscreensItem
 import org.moqui.impl.screen.ScreenForm.FormInstance
@@ -107,7 +108,7 @@ class ScreenRenderImpl implements ScreenRender {
             internalWriter = response.getWriter()
             return internalWriter
         }
-        throw new BaseException("Could not render screen, no writer available")
+        throw new BaseArtifactException("Could not render screen, no writer available")
     }
 
     ScreenUrlInfo getScreenUrlInfo() { return screenUrlInfo }
@@ -133,14 +134,16 @@ class ScreenRenderImpl implements ScreenRender {
         this.request = request
         this.response = response
         // NOTE: don't get the writer at this point, we don't yet know if we're writing text or binary
-        if (webappName == null || webappName.length() == 0)
-            webappName(request.servletContext.getInitParameter("moqui-name"))
+        if (webappName == null || webappName.length() == 0) webappName(request.servletContext.getInitParameter("moqui-name"))
         if (webappName != null && webappName.length() > 0 && (rootScreenLocation == null || rootScreenLocation.length() == 0))
             rootScreenFromHost(request.getServerName())
         if (originalScreenPathNameList == null || originalScreenPathNameList.size() == 0) {
             String pathInfo = request.getPathInfo()
             if (pathInfo != null) screenPath(Arrays.asList(pathInfo.split("/")))
         }
+        if (servletContextPath == null || servletContextPath.isEmpty())
+            servletContextPath = request.getServletContext()?.getContextPath()
+
         // now render
         internalRender()
     }
@@ -165,41 +168,61 @@ class ScreenRenderImpl implements ScreenRender {
     /** this should be called as part of a always-actions or pre-actions block to stop rendering before it starts */
     void sendRedirectAndStopRender(String redirectUrl) {
         if (response != null) {
+            if (servletContextPath != null && !servletContextPath.isEmpty() && redirectUrl.startsWith("/"))
+                redirectUrl = servletContextPath + redirectUrl
             response.sendRedirect(redirectUrl)
             dontDoRender = true
             if (logger.isInfoEnabled()) logger.info("Redirecting to ${redirectUrl} instead of rendering ${this.getScreenUrlInfo().getFullPathNameList()}")
         }
     }
-    boolean sendJsonRedirect(UrlInstance fullUrl) {
+    boolean sendJsonRedirect(UrlInstance fullUrl, Long renderStartTime) {
         if ("json".equals(screenUrlInfo.targetTransitionExtension) || request?.getHeader("Accept")?.contains("application/json")) {
-            Map<String, Object> responseMap = new HashMap<>()
-            // add saveMessagesToSession, saveRequestParametersToSession/saveErrorParametersToSession data
-            // add all plain object data from session?
-            if (ec.message.getMessages().size() > 0) responseMap.put("messages", ec.message.messages)
-            if (ec.message.getErrors().size() > 0) responseMap.put("errors", ec.message.errors)
-            if (ec.message.getValidationErrors().size() > 0) {
-                List<ValidationError> valErrorList = ec.message.getValidationErrors()
-                int valErrorListSize = valErrorList.size()
-                ArrayList<Map> valErrMapList = new ArrayList<>(valErrorListSize)
-                for (int i = 0; i < valErrorListSize; i++) valErrMapList.add(valErrorList.get(i).getMap())
-                responseMap.put("validationErrors", valErrMapList)
-            }
-
-            Map parms = new HashMap()
-            if (ec.web.requestParameters != null) parms.putAll(ec.web.requestParameters)
-            if (ec.web.requestAttributes != null) parms.putAll(ec.web.requestAttributes)
-            responseMap.put("currentParameters", ContextJavaUtil.unwrapMap(parms))
-
+            String pathWithParams = fullUrl.getPathWithParams()
+            Map<String, Object> responseMap = getBasicResponseMap()
             // add screen path, parameters from fullUrl
             responseMap.put("screenPathList", fullUrl.sui.fullPathNameList)
             responseMap.put("screenParameters", fullUrl.getParameterMap())
-            responseMap.put("screenUrl", fullUrl.getPathWithParams())
-
+            responseMap.put("screenUrl", pathWithParams)
+            // send it
+            ec.web.sendJsonResponse(responseMap)
+            if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")}${renderStartTime != null ? ' in ' + (System.currentTimeMillis() - renderStartTime) + 'ms' : ''}, JSON redirect to: ${pathWithParams}")
+            return true
+        } else {
+            return false
+        }
+    }
+    boolean sendJsonRedirect(String plainUrl) {
+        if ("json".equals(screenUrlInfo.targetTransitionExtension) || request?.getHeader("Accept")?.contains("application/json")) {
+            Map<String, Object> responseMap = getBasicResponseMap()
+            // the plain URL, send as redirect URL
+            responseMap.put("redirectUrl", plainUrl)
+            // send it
             ec.web.sendJsonResponse(responseMap)
             return true
         } else {
             return false
         }
+    }
+    Map<String, Object> getBasicResponseMap() {
+        Map<String, Object> responseMap = new HashMap<>()
+        // add saveMessagesToSession, saveRequestParametersToSession/saveErrorParametersToSession data
+        // add all plain object data from session?
+        if (ec.message.getMessages().size() > 0) responseMap.put("messages", ec.message.messages)
+        if (ec.message.getErrors().size() > 0) responseMap.put("errors", ec.message.errors)
+        if (ec.message.getValidationErrors().size() > 0) {
+            List<ValidationError> valErrorList = ec.message.getValidationErrors()
+            int valErrorListSize = valErrorList.size()
+            ArrayList<Map> valErrMapList = new ArrayList<>(valErrorListSize)
+            for (int i = 0; i < valErrorListSize; i++) valErrMapList.add(valErrorList.get(i).getMap())
+            responseMap.put("validationErrors", valErrMapList)
+        }
+
+        Map parms = new HashMap()
+        if (ec.web.requestParameters != null) parms.putAll(ec.web.requestParameters)
+        if (ec.web.requestAttributes != null) parms.putAll(ec.web.requestAttributes)
+        responseMap.put("currentParameters", ContextJavaUtil.unwrapMap(parms))
+
+        return responseMap
     }
 
     protected void internalRender() {
@@ -209,7 +232,7 @@ class ScreenRenderImpl implements ScreenRender {
         long renderStartTime = System.currentTimeMillis()
 
         rootScreenDef = sfi.getScreenDefinition(rootScreenLocation)
-        if (rootScreenDef == null) throw new BaseException("Could not find root screen at location ${rootScreenLocation}")
+        if (rootScreenDef == null) throw new BaseArtifactException("Could not find root screen at location ${rootScreenLocation}")
 
         if (logger.traceEnabled) logger.trace("Rendering screen ${rootScreenLocation} with path list ${originalScreenPathNameList}")
         // logger.info("Rendering screen [${rootScreenLocation}] with path list [${originalScreenPathNameList}]")
@@ -281,7 +304,7 @@ class ScreenRenderImpl implements ScreenRender {
                         (!request.isSecure() && webappInfo.httpsEnabled) ||
                         (queryString != null && queryString.length() > 0) ||
                         (pathInfoParameterMap != null && pathInfoParameterMap.size() > 0))) {
-                    throw new IllegalArgumentException(
+                    throw new BaseArtifactException(
                         """Cannot run screen transition with actions from non-secure request or with URL
                         parameters for security reasons (they are not encrypted and need to be for data
                         protection and source validation). Change the link this came from to be a
@@ -336,11 +359,11 @@ class ScreenRenderImpl implements ScreenRender {
                     sfi.ecfi.countArtifactHit(ArtifactExecutionInfo.AT_XML_SCREEN_TRANS, riType != null ? riType : "",
                             targetTransition.parentScreen.getLocation() + "#" + targetTransition.name,
                             (web != null ? web.requestParameters : null), renderStartTime,
-                            (System.nanoTime() - startTimeNanos)/1E6, null)
+                            (System.nanoTime() - startTimeNanos)/1000000.0D, null)
                 }
             }
 
-            if (ri == null) throw new IllegalArgumentException("No response found for transition [${screenUrlInstance.targetTransition.name}] on screen ${screenUrlInfo.targetScreen.location}")
+            if (ri == null) throw new BaseArtifactException("No response found for transition [${screenUrlInstance.targetTransition.name}] on screen ${screenUrlInfo.targetScreen.location}")
 
             WebFacadeImpl wfi = (WebFacadeImpl) null
             if (web != null && web instanceof WebFacadeImpl) wfi = (WebFacadeImpl) web
@@ -352,7 +375,7 @@ class ScreenRenderImpl implements ScreenRender {
             }
 
             if ("none".equals(ri.type)) {
-                if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, type none response")
+                if (logger.isTraceEnabled()) logger.trace("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, type none response")
                 return
             }
 
@@ -410,10 +433,16 @@ class ScreenRenderImpl implements ScreenRender {
                     }
                     // NOTE: even if transition extension is json still send redirect when we just have a plain url
                     if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, redirecting to plain URL: ${fullUrl}")
-                    response.sendRedirect(fullUrl)
+                    if (!sendJsonRedirect(fullUrl)) {
+                        response.sendRedirect(fullUrl)
+                    }
                 } else {
                     // default is screen-path
                     UrlInstance fullUrl = buildUrl(rootScreenDef, screenUrlInfo.preTransitionPathNameList, url)
+                    // copy through pageIndex if passed so in form-list with multiple pages we stay on same page
+                    if (web.requestParameters.containsKey("pageIndex")) fullUrl.addParameter("pageIndex", (String) web.parameters.get("pageIndex"))
+                    // copy through orderByField if passed so in form-list with multiple pages we retain the sort order
+                    if (web.requestParameters.containsKey("orderByField")) fullUrl.addParameter("orderByField", (String) web.parameters.get("orderByField"))
                     fullUrl.addParameters(ri.expandParameters(screenUrlInfo.getExtraPathNameList(), ec))
                     // if this was a screen-last and the screen has declared parameters include them in the URL
                     Map savedParameters = wfi?.getSavedParameters()
@@ -439,8 +468,8 @@ class ScreenRenderImpl implements ScreenRender {
                         }
                     }
 
-                    if (!sendJsonRedirect(fullUrl)) {
-                        String fullUrlString = fullUrl.getUrlWithParams()
+                    if (!sendJsonRedirect(fullUrl, renderStartTime)) {
+                        String fullUrlString = fullUrl.getUrlWithParams(screenUrlInfo.targetTransitionExtension)
                         if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, redirecting to screen path URL: ${fullUrlString}")
                         response.sendRedirect(fullUrlString)
                     }
@@ -490,14 +519,14 @@ class ScreenRenderImpl implements ScreenRender {
                         if (screenUrlInfo.targetScreen.screenNode.attribute("track-artifact-hit") != "false") {
                             sfi.ecfi.countArtifactHit(ArtifactExecutionInfo.AT_XML_SCREEN_CONTENT, fileContentType,
                                     fileResourceRef.location, (web != null ? web.requestParameters : null),
-                                    resourceStartTime, (System.nanoTime() - startTimeNanos)/1E6, (long) totalLen)
+                                    resourceStartTime, (System.nanoTime() - startTimeNanos)/1000000.0D, (long) totalLen)
                         }
                         if (isTraceEnabled) logger.trace("Sent binary response of length ${totalLen} from file ${fileResourceRef.location} for request to ${screenUrlInstance.url}")
                     } finally {
                         if (is != null) is.close()
                     }
                 } else {
-                    throw new IllegalArgumentException("Tried to get binary content at ${screenUrlInfo.fileResourcePathList} under screen ${screenUrlInfo.targetScreen.location}, but there is no HTTP response available")
+                    throw new BaseArtifactException("Tried to get binary content at ${screenUrlInfo.fileResourcePathList} under screen ${screenUrlInfo.targetScreen.location}, but there is no HTTP response available")
                 }
             } else if (!"true".equals(screenUrlInfo.targetScreen.screenNode.attribute("include-child-content"))) {
                 // not a binary object (hopefully), read it and write it to the writer
@@ -531,7 +560,7 @@ class ScreenRenderImpl implements ScreenRender {
                         if (!"false".equals(screenUrlInfo.targetScreen.screenNode.attribute("track-artifact-hit"))) {
                             sfi.ecfi.countArtifactHit(ArtifactExecutionInfo.AT_XML_SCREEN_CONTENT, fileContentType,
                                     fileResourceRef.location, (web != null ? web.requestParameters : null),
-                                    resourceStartTime, (System.nanoTime() - startTimeNanos)/1E6, (long) text.length())
+                                    resourceStartTime, (System.nanoTime() - startTimeNanos)/1000000.0D, (long) text.length())
                         }
                     } else {
                         logger.warn("Not sending text response from file [${fileResourceRef.location}] for request to [${screenUrlInstance.url}] because no text was found in the file.")
@@ -543,8 +572,10 @@ class ScreenRenderImpl implements ScreenRender {
             }
         } else {
             doActualRender()
-            if (response != null && logger.isInfoEnabled())
-                logger.info("${screenUrlInfo.getFullPathNameList().join("/")} in ${(System.currentTimeMillis()-renderStartTime)}ms (${response.getContentType()}) session ${request.session.id}")
+            if (response != null && logger.isInfoEnabled()) {
+                Map<String, Object> reqParms = web?.getRequestParameters()
+                logger.info("${screenUrlInfo.getFullPathNameList().join("/")} ${reqParms != null && reqParms.size() > 0 ? reqParms : '[]'} in ${(System.currentTimeMillis()-renderStartTime)}ms (${response.getContentType()}) session ${request.session.id}")
+            }
         }
     }
 
@@ -554,7 +585,7 @@ class ScreenRenderImpl implements ScreenRender {
         // the transition itself, it's fine
         ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(sd.location,
                 ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, null)
-        ec.artifactExecutionFacade.pushInternal(aei, false)
+        ec.artifactExecutionFacade.pushInternal(aei, false, false)
 
         boolean loggedInAnonymous = false
         ResponseItem ri = (ResponseItem) null
@@ -596,8 +627,8 @@ class ScreenRenderImpl implements ScreenRender {
         MNode screenNode = sd.getScreenNode()
         String requireAuthentication = screenNode.attribute("require-authentication")
         ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(sd.location,
-                ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, outputContentType)
-        ec.artifactExecutionFacade.pushInternal(aei, !activeScreenHasNext ? (!requireAuthentication || requireAuthentication == "true") : false)
+                ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, outputContentType).setTrackArtifactHit(false)
+        ec.artifactExecutionFacade.pushInternal(aei, !activeScreenHasNext ? (!requireAuthentication || requireAuthentication == "true") : false, false)
 
         boolean loggedInAnonymous = false
         try {
@@ -683,7 +714,7 @@ class ScreenRenderImpl implements ScreenRender {
 
                     ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(permSd.location,
                             ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, outputContentType)
-                    ec.artifactExecutionFacade.pushInternal(aei, false)
+                    ec.artifactExecutionFacade.pushInternal(aei, false, false)
                     aeiList.add(aei)
                 }
             }
@@ -770,7 +801,7 @@ class ScreenRenderImpl implements ScreenRender {
 
         MNode webSettingsNode = currentSd.webSettingsNode
         if (webSettingsNode != null && "false".equals(webSettingsNode.attribute("allow-web-request")))
-            throw new IllegalArgumentException("The screen [${currentSd.location}] cannot be used in a web request (allow-web-request=false).")
+            throw new BaseArtifactException("The screen [${currentSd.location}] cannot be used in a web request (allow-web-request=false).")
 
         String mimeType = webSettingsNode != null ? webSettingsNode.attribute("mime-type") : null
         if (mimeType != null && mimeType.length() > 0) this.outputContentType = mimeType
@@ -977,7 +1008,7 @@ class ScreenRenderImpl implements ScreenRender {
         ScreenDefinition sd = getActiveScreenDef()
         try {
             ScreenSection section = sd.getSection(sectionName)
-            if (section == null) throw new IllegalArgumentException("No section with name [${sectionName}] in screen [${sd.location}]")
+            if (section == null) throw new BaseArtifactException("No section with name [${sectionName}] in screen [${sd.location}]")
             writer.flush()
             section.render(this)
             writer.flush()
@@ -1003,7 +1034,7 @@ class ScreenRenderImpl implements ScreenRender {
         FormInstance formNode = screenFormCache.get(nodeCacheKey)
         if (formNode == null) {
             ScreenForm form = sd.getForm(formName)
-            if (!form) throw new IllegalArgumentException("No form with name [${formName}] in screen [${sd.location}]")
+            if (!form) throw new BaseArtifactException("No form with name [${formName}] in screen [${sd.location}]")
             formNode = form.getFormInstance()
             screenFormCache.put(nodeCacheKey, formNode)
         }
@@ -1020,7 +1051,7 @@ class ScreenRenderImpl implements ScreenRender {
             writer.flush()
 
             ScreenDefinition screenDef = sfi.getScreenDefinition(location)
-            if (!screenDef) throw new BaseException("Could not find screen at location [${location}]")
+            if (!screenDef) throw new BaseArtifactException("Could not find screen at location [${location}]")
             overrideActiveScreenDef = screenDef
             screenDef.render(this, false)
 
@@ -1131,7 +1162,7 @@ class ScreenRenderImpl implements ScreenRender {
             // for transition we want a URL relative to the current screen, so just pass that to buildUrl
             case "transition": suInfo = buildUrlInfo(origUrl); break
             case "screen": suInfo = buildUrlInfo(origUrl); break
-            case "content": throw new IllegalArgumentException("The url-type of content is not yet supported"); break
+            case "content": throw new BaseArtifactException("The url-type of content is not yet supported"); break
             case "plain":
             default:
                 String url = ec.resource.expand(origUrl, "")
@@ -1143,14 +1174,18 @@ class ScreenRenderImpl implements ScreenRender {
 
         if (parameterParentNode != null) {
             String parameterMapStr = (String) parameterParentNode.attribute("parameter-map")
-            if (parameterMapStr) {
+            if (parameterMapStr != null && !parameterMapStr.isEmpty()) {
                 Map ctxParameterMap = (Map) ec.resource.expression(parameterMapStr, "")
                 if (ctxParameterMap) urli.addParameters(ctxParameterMap)
             }
-            for (MNode parameterNode in parameterParentNode.children("parameter")) {
+            ArrayList<MNode> parameterNodes = parameterParentNode.children("parameter")
+            int parameterNodesSize = parameterNodes.size()
+            for (int i = 0; i < parameterNodesSize; i++) {
+                MNode parameterNode = (MNode) parameterNodes.get(i)
                 String name = parameterNode.attribute("name")
-                urli.addParameter(name, getContextValue(
-                        parameterNode.attribute("from") ?: name, parameterNode.attribute("value")))
+                String from = parameterNode.attribute("from")
+                if (from == null || from.isEmpty()) from = name
+                urli.addParameter(name, getContextValue(from, parameterNode.attribute("value")))
             }
         }
 
@@ -1159,9 +1194,9 @@ class ScreenRenderImpl implements ScreenRender {
 
     Object getContextValue(String from, String value) {
         if (value) {
-            return ec.resource.expand(value, getActiveScreenDef().location)
+            return ec.resource.expand(value, getActiveScreenDef().location, (Map) ec.contextStack.get("_formMap"))
         } else if (from) {
-            return ec.resource.expression(from, getActiveScreenDef().location)
+            return ec.resource.expression(from, getActiveScreenDef().location, (Map) ec.contextStack.get("_formMap"))
         } else {
             return ""
         }
@@ -1173,29 +1208,34 @@ class ScreenRenderImpl implements ScreenRender {
                 setNode.attribute("set-if-empty"))
         return ""
     }
-    String pushContext() { ec.getContext().push(); return "" }
-    String popContext() { ec.getContext().pop(); return "" }
+    String pushContext() { ec.contextStack.push(); return "" }
+    String popContext() { ec.contextStack.pop(); return "" }
 
-    /** Call this at the beginning of a form-single. Always call popContext() at the end of the form! */
-    String pushSingleFormMapContext(MNode formNode) {
-        ContextStack cs = ec.getContext()
-        String mapName = formNode.attribute("map") ?: "fieldValues"
-        Map valueMap = (Map) cs.getByString(mapName)
+    /** Call this at the beginning of a form-single or for form-list.@first-row-map and @last-row-map. Always call popContext() at the end of the form! */
+    String pushSingleFormMapContext(String mapExpr) {
+        ContextStack cs = ec.contextStack
+        Map valueMap = null
+        if (mapExpr != null && !mapExpr.isEmpty()) valueMap = (Map) ec.resourceFacade.expression(mapExpr, null)
+        if (valueMap instanceof EntityValue) valueMap = ((EntityValue) valueMap).getMap()
+        if (valueMap == null) valueMap = new HashMap()
 
         cs.push()
-        if (valueMap) cs.putAll(valueMap)
+        cs.putAll(valueMap)
         cs.put("_formMap", valueMap)
-        cs.put(mapName, valueMap)
 
         return ""
     }
     String startFormListRow(ScreenForm.FormListRenderInfo listRenderInfo, Object listEntry, int index, boolean hasNext) {
-        ec.contextStack.push()
+        ContextStack cs = ec.contextStack
+        cs.push()
 
         if (listEntry instanceof Map) {
-            ec.contextStack.putAll((Map) listEntry)
+            Map valueMap = (Map) listEntry
+            if (valueMap instanceof EntityValue) valueMap = ((EntityValue) valueMap).getMap()
+            cs.putAll(valueMap)
+            cs.put("_formMap", valueMap)
         } else {
-            throw new IllegalArgumentException("Found form-list ${listRenderInfo.getFormNode().attribute('name')} list entry that is not a Map, is a ${listEntry.class.name} which should never happen after running list through list pre-processor")
+            throw new BaseArtifactException("Found form-list ${listRenderInfo.getFormNode().attribute('name')} list entry that is not a Map, is a ${listEntry.class.name} which should never happen after running list through list pre-processor")
         }
         // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
         return ""
@@ -1206,17 +1246,21 @@ class ScreenRenderImpl implements ScreenRender {
         return ""
     }
     String startFormListSubRow(ScreenForm.FormListRenderInfo listRenderInfo, Object subListEntry, int index, boolean hasNext) {
-        ec.contextStack.push()
+        ContextStack cs = ec.contextStack
+        cs.push()
         MNode formNode = listRenderInfo.formNode
         if (subListEntry instanceof Map) {
-            ec.contextStack.putAll((Map) subListEntry)
+            Map valueMap = (Map) subListEntry
+            if (valueMap instanceof EntityValue) valueMap = ((EntityValue) valueMap).getMap()
+            cs.putAll(valueMap)
+            cs.put("_formMap", valueMap)
         } else {
-            throw new IllegalArgumentException("Found form-list ${listRenderInfo.getFormNode().attribute('name')} sub-list entry that is not a Map, is a ${subListEntry.class.name} which should never happen after running list through list pre-processor")
+            throw new BaseArtifactException("Found form-list ${listRenderInfo.getFormNode().attribute('name')} sub-list entry that is not a Map, is a ${subListEntry.class.name} which should never happen after running list through list pre-processor")
         }
         String listStr = formNode.attribute('list')
-        ec.contextStack.put(listStr + "_sub_index", index)
-        ec.contextStack.put(listStr + "_sub_has_next", hasNext)
-        ec.contextStack.put(listStr + "_sub_entry", subListEntry)
+        cs.put(listStr + "_sub_index", index)
+        cs.put(listStr + "_sub_has_next", hasNext)
+        cs.put(listStr + "_sub_entry", subListEntry)
         // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
         return ""
     }
@@ -1261,6 +1305,31 @@ class ScreenRenderImpl implements ScreenRender {
             return ec.resourceFacade.expandNoL10n(defaultValue, "")
         return ObjectUtilities.toPlainString(obj)
     }
+    String getNamedValuePlain(String fieldName, MNode formNode) {
+        Object value = null
+        if ("form-single".equals(formNode.name)) {
+            String mapAttr = formNode.attribute("map")
+            String mapName = mapAttr != null && mapAttr.length() > 0 ? mapAttr : "fieldValues"
+            Map valueMap = (Map) ec.resource.expression(mapName, "")
+
+            if (valueMap != null) {
+                try {
+                    if (valueMap instanceof EntityValueBase) {
+                        // if it is an EntityValueImpl, only get if the fieldName is a value
+                        EntityValueBase evb = (EntityValueBase) valueMap
+                        if (evb.getEntityDefinition().isField(fieldName)) value = evb.get(fieldName)
+                    } else {
+                        value = valueMap.get(fieldName)
+                    }
+                } catch (EntityException e) {
+                    // do nothing, not necessarily an entity field
+                    if (isTraceEnabled) logger.trace("Ignoring entity exception for non-field: ${e.toString()}")
+                }
+            }
+        }
+        if (value == null) value = ec.contextStack.getByString(fieldName)
+        return ObjectUtilities.toPlainString(value)
+    }
 
     Object getFieldValue(MNode fieldNode, String defaultValue) {
         String fieldName = fieldNode.attribute("name")
@@ -1288,7 +1357,7 @@ class ScreenRenderImpl implements ScreenRender {
                 try {
                     if (valueMap instanceof EntityValueBase) {
                         // if it is an EntityValueImpl, only get if the fieldName is a value
-                        EntityValueBase evb = (EntityValueImpl) valueMap
+                        EntityValueBase evb = (EntityValueBase) valueMap
                         if (evb.getEntityDefinition().isField(fieldName)) value = evb.get(fieldName)
                     } else {
                         value = valueMap.get(fieldName)
@@ -1360,7 +1429,181 @@ class ScreenRenderImpl implements ScreenRender {
     }
 
     LinkedHashMap<String, String> getFieldOptions(MNode widgetNode) {
-        return ScreenForm.getFieldOptions(widgetNode, ec)
+        LinkedHashMap<String, String> optsMap = ScreenForm.getFieldOptions(widgetNode, ec)
+        if (optsMap.size() == 0 && widgetNode.hasChild("dynamic-options")) {
+            MNode childNode = widgetNode.first("dynamic-options")
+            if (!"true".equals(childNode.attribute("server-search"))) {
+                // a bit of a hack, use ScreenTest to call the transition server-side as if it were a web request
+                String transition = childNode.attribute("transition")
+                String labelField = childNode.attribute("label-field") ?: "label"
+                String valueField = childNode.attribute("value-field") ?: "value"
+
+                Map<String, Object> parameters = new HashMap<>()
+                boolean hasAllDepends = addNodeParameters(childNode, parameters)
+                // logger.warn("getFieldOptions parameters ${parameters}")
+
+                if (hasAllDepends) {
+                    UrlInstance transUrl = buildUrl(transition)
+                    ScreenTest screenTest = ec.screen.makeTest().rootScreen(rootScreenLocation).skipJsonSerialize(true)
+                    ScreenTest.ScreenTestRender str = screenTest.render(transUrl.getPathWithParams(), parameters, null)
+
+                    Object jsonObj = str.getJsonObject()
+                    List optsList = null
+                    if (jsonObj instanceof List) {
+                        optsList = (List) jsonObj
+                    } else if (jsonObj instanceof Map) {
+                        Map jsonMap = (Map) jsonObj
+                        Object optionsObj = jsonMap.get("options")
+                        if (optionsObj instanceof List) optsList = (List) optionsObj
+                    }
+                    if (optsList != null) for (Object entryObj in optsList) {
+                        if (entryObj instanceof Map) {
+                            Map entryMap = (Map) entryObj
+                            String valueObj = entryMap.get(valueField)
+                            String labelObj = entryMap.get(labelField)
+                            if (valueObj && labelObj) optsMap.put(valueObj, labelObj)
+                        }
+                    }
+
+                    /* old approach before skipJsonSerialize
+                    String output = str.getOutput()
+
+                    try {
+                        Object jsonObj = new JsonSlurper().parseText(output)
+                        List optsList = null
+                        if (jsonObj instanceof List) {
+                            optsList = (List) jsonObj
+                        } else if (jsonObj instanceof Map) {
+                            Map jsonMap = (Map) jsonObj
+                            Object optionsObj = jsonMap.get("options")
+                            if (optionsObj instanceof List) optsList = (List) optionsObj
+                        }
+                        if (optsList != null) for (Object entryObj in optsList) {
+                            if (entryObj instanceof Map) {
+                                Map entryMap = (Map) entryObj
+                                String valueObj = entryMap.get(valueField)
+                                String labelObj = entryMap.get(labelField)
+                                if (valueObj && labelObj) optsMap.put(valueObj, labelObj)
+                            }
+                        }
+                    } catch (Throwable t) {
+                        logger.warn("Error getting field options from transition", t)
+                    }
+                    */
+                }
+            }
+        }
+        return optsMap
+    }
+
+    /** This is messy, does a server-side/internal 'test' render so we can get the label/description for the current value
+     * from the transition written for client access. */
+    String getFieldTransitionValue(String transition, MNode parameterParentNode, String term, String labelField, boolean alwaysGet) {
+        if (!alwaysGet && (term == null || term.isEmpty())) return null
+        if (!labelField) labelField = "label"
+
+        Map<String, Object> parameters = new HashMap<>()
+        parameters.put("term", term)
+        boolean hasAllDepends = addNodeParameters(parameterParentNode, parameters)
+        // logger.warn("getFieldTransitionValue parameters ${parameters}")
+        // logger.warn("getFieldTransitionValue context ${ec.context.keySet()}")
+        if (!hasAllDepends) return null
+
+        UrlInstance transUrl = buildUrl(transition)
+        ScreenTest screenTest = sfi.makeTest().rootScreen(rootScreenLocation)
+        ScreenTest.ScreenTestRender str = screenTest.render(transUrl.getPathWithParams(), parameters, null)
+        String output = str.getOutput()
+
+        String transValue = null
+        Object jsonObj = null
+        try {
+            jsonObj = new JsonSlurper().parseText(output)
+            if (jsonObj instanceof List && ((List) jsonObj).size() > 0) {
+                Object firstObj = ((List) jsonObj).get(0)
+                if (firstObj instanceof Map) {
+                    transValue = ((Map) firstObj).get(labelField)
+                } else {
+                    transValue = firstObj.toString()
+                }
+            } else if (jsonObj instanceof Map) {
+                Map jsonMap = (Map) jsonObj
+                Object optionsObj = jsonMap.get("options")
+                if (optionsObj instanceof List && ((List) optionsObj).size() > 0) {
+                    Object firstObj = ((List) optionsObj).get(0)
+                    if (firstObj instanceof Map) {
+                        transValue = ((Map) firstObj).get(labelField)
+                    } else {
+                        transValue = firstObj.toString()
+                    }
+                } else {
+                    transValue = jsonMap.get(labelField)
+                }
+            } else if (jsonObj != null) {
+                transValue = jsonObj.toString()
+            }
+        } catch (Throwable t) {
+            // this happens all the time for non-JSON text response: logger.warn("Error getting field label from transition", t)
+            transValue = output
+        }
+
+        // logger.warn("term ${term} output ${output} transValue ${transValue}")
+        return transValue
+    }
+
+    Map<String, String> getFormHiddenParameters(MNode formNode) {
+        Map<String, String> parmMap = new LinkedHashMap<>()
+        if (formNode == null) return parmMap
+        MNode hiddenParametersNode = formNode.first("hidden-parameters")
+        if (hiddenParametersNode == null) return parmMap
+
+        Map<String, Object> objMap = new LinkedHashMap<>()
+        addNodeParameters(hiddenParametersNode, objMap)
+        for (Map.Entry<String, Object> entry in objMap.entrySet()) {
+            Object valObj = entry.getValue()
+            String valStr = ObjectUtilities.toPlainString(valObj)
+            if (valStr != null && !valStr.isEmpty()) parmMap.put(entry.getKey(), valStr)
+        }
+
+        return parmMap
+    }
+
+    boolean addNodeParameters(MNode parameterParentNode, Map<String, Object> parameters) {
+        if (parameterParentNode == null) return true
+        // get specified parameters
+        String parameterMapStr = (String) parameterParentNode.attribute("parameter-map")
+        if (parameterMapStr != null && !parameterMapStr.isEmpty()) {
+            Map ctxParameterMap = (Map) ec.resource.expression(parameterMapStr, "")
+            if (ctxParameterMap != null) parameters.putAll(ctxParameterMap)
+        }
+        ArrayList<MNode> parameterNodes = parameterParentNode.children("parameter")
+        int parameterNodesSize = parameterNodes.size()
+        for (int i = 0; i < parameterNodesSize; i++) {
+            MNode parameterNode = (MNode) parameterNodes.get(i)
+            String name = parameterNode.attribute("name")
+            String from = parameterNode.attribute("from")
+            if (from == null || from.isEmpty()) from = name
+            parameters.put(name, getContextValue(from, parameterNode.attribute("value")))
+        }
+
+        // get current values for depends-on fields
+        boolean dependsOptional = "true".equals(parameterParentNode.attribute("depends-optional"))
+        boolean hasAllDepends = true
+        ArrayList<MNode> doNodeList = parameterParentNode.children("depends-on")
+        for (int i = 0; i < doNodeList.size(); i++) {
+            MNode doNode = (MNode) doNodeList.get(i)
+            String doField = doNode.attribute("field")
+            String doParameter = doNode.attribute("parameter") ?: doField
+            Object contextVal = ec.context.get(doField)
+            if (ObjectUtilities.isEmpty(contextVal) && ec.contextStack.get("_formMap") != null)
+                contextVal = ((Map) ec.contextStack.get("_formMap")).get(doField)
+            if (ObjectUtilities.isEmpty(contextVal)) {
+                hasAllDepends = false
+            } else {
+                parameters.put(doParameter, contextVal)
+            }
+        }
+
+        return hasAllDepends || dependsOptional
     }
 
     boolean isInCurrentScreenPath(List<String> pathNameList) {
@@ -1565,6 +1808,7 @@ class ScreenRenderImpl implements ScreenRender {
         String lastPath = currentPath.toString()
         String paramString = fullUrlInstance.getParameterString()
         if (paramString.length() > 0) currentPath.append('?').append(paramString)
+
         String lastImage = fullUrlInfo.menuImage
         String lastImageType = fullUrlInfo.menuImageType
         if (lastImage != null && lastImage.length() > 0 && (lastImageType == null || lastImageType.length() == 0 || "url-screen".equals(lastImageType)))
@@ -1572,6 +1816,7 @@ class ScreenRenderImpl implements ScreenRender {
         String lastTitle = fullUrlInfo.targetScreen.getDefaultMenuName()
         if (lastTitle.contains('${')) lastTitle = ec.resourceFacade.expand(lastTitle, "")
         List<Map<String, Object>> screenDocList = fullUrlInfo.targetScreen.getScreenDocumentInfoList()
+
         Map lastMap = [name:lastPathItem, title:lastTitle, path:lastPath, pathWithParams:currentPath.toString(), image:lastImage,
                 extraPathList:extraPathList, screenDocList:screenDocList]
         if ("icon".equals(lastImageType)) lastMap.imageType = "icon"
